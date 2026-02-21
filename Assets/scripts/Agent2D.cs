@@ -8,16 +8,20 @@ using System.Collections.Generic;
 public class Agent2D : Agent
 {
     [Header("Agent Configuration")]
+    public bool isManualControl = false;
     public RayPerceptionSensorComponent2D raySensor;
     public Transform[] goals;
     public Transform[] obstacles;
     public AudioSource targetReached;
     public AudioSource droneHum;
+    public int maxStepCount = 2000;
+    float targetDistance = 0.0f;
+    int obstacleCount = 0;
     Vector2 lastPos;
-    float shortestPath = 0.0f;
-    float distanceTraveled = 0.0f;
+    float shortestPath = 0f;
+    float distanceTraveled = 0f;
     int goalsReached = 0;
-    bool groundCollision = false;
+    int groundCollision = 0;
     int targetIndex = 0;
     int StepCnt = 0;
     Rigidbody2D rb;
@@ -28,12 +32,39 @@ public class Agent2D : Agent
     float previousDistance = Mathf.Infinity; // Track distance to target for reward shaping
 
 
-    public override void Initialize()
-    {
+    public override void Initialize(){
         rb = GetComponent<Rigidbody2D>();
+    }
+    Vector2 GetRandomTargetPosition(){
+        Vector2 dronePos = transform.localPosition;
+        float minDistance = 2f;
+        if(targetDistance >=10f) minDistance = 5f;
+        float distance = Random.Range(minDistance, Mathf.Max(minDistance, targetDistance));
+        float forbiddenAngle = Mathf.PI / 2f; // straight up
+        float angleOffset = Mathf.PI / 6f;    // 30° buffer
+        float angle;
+        do {
+            angle = Random.Range(0f, Mathf.PI);
+        } while (angle > (forbiddenAngle - angleOffset) && angle < (forbiddenAngle + angleOffset));
+        float offsetX = Mathf.Cos(angle) * distance;
+        float offsetY = Mathf.Sin(angle) * distance;
+            // Raw target
+        float targetX = dronePos.x + offsetX;
+        float targetY = dronePos.y + offsetY;
+        // Clamp to valid flight area
+        targetX = Mathf.Clamp(targetX, -16f, 16f);
+        targetY = Mathf.Clamp(targetY, -6f, 8f);
+
+        return new Vector2(targetX, targetY);
+    }
+    void InitCurriculumEnv(){
+        var envParams = Academy.Instance.EnvironmentParameters;
+        targetDistance = envParams.GetWithDefault("target_distance", 0.0f);
+        obstacleCount = (int)envParams.GetWithDefault("obstacle_count", 0f);
     }
     
     float DistanceToTarget(){
+        if (!goals[targetIndex].gameObject.activeSelf) return 0f;
         return Vector2.Distance(goals[targetIndex].localPosition, transform.localPosition);
     }
     void calculateShortestPath(){
@@ -72,29 +103,20 @@ public class Agent2D : Agent
         }
         return newDeltaX;
     }
-    public override void OnEpisodeBegin()
-    {
-        
-        if (StepCnt > 0)
-        {
-            var recorder = Academy.Instance.StatsRecorder;
-            recorder.Add("EpisodeLength", StepCnt);
-            recorder.Add("TargetsFound", goalsReached);
-            recorder.Add("PathEfficiency", shortestPath / Mathf.Max(distanceTraveled, 0.001f));
-        }
+    public override void OnEpisodeBegin(){
+        InitCurriculumEnv();
+        RecordStats();
         rb.linearVelocity = Vector2.zero;
         rb.angularVelocity = 0f;
         targetY = transform.localPosition.y;
-        shortestPath = 0.0f;
+        shortestPath = 0f;
         lastPos = transform.localPosition;
-        distanceTraveled = 0.0f;
+        distanceTraveled = 0f;
         StepCnt = 0;
-        groundCollision = false;
-        if (goalsReached != 0)
-        {
+        groundCollision = 0;
+        if (goalsReached != 0){
             goalsReached = 0;
-            foreach (Transform goal in goals)
-            {
+            foreach (Transform goal in goals){
                 goal.gameObject.SetActive(true);
             }
         }
@@ -103,26 +125,33 @@ public class Agent2D : Agent
         rb.Sleep();
         rb.WakeUp();
         for (int i = 0; i < goals.Length; i++){
-            goals[i].localPosition = new Vector2(Random.Range(-15f, 15f), Random.Range(-3f, 2f));
+            goals[i].localPosition = GetRandomTargetPosition();
         }
-        for (int i = 0; i < obstacles.Length; i++){
+        int maxObs = Mathf.Min(obstacleCount, obstacles.Length); // safety check
+        for (int i = 0; i < maxObs; i++){
             int randomIndex = Random.Range(i, obstacles.Length);
             Vector2 pos1 = obstacles[i].localPosition;
             Vector2 pos2 = obstacles[randomIndex].localPosition;
             obstacles[i].localPosition = new Vector2(pos2.x, pos1.y);
             obstacles[randomIndex].localPosition = new Vector2(pos1.x, pos2.y);
+            obstacles[i].gameObject.SetActive(true); // make sure it's visible
         }
+
+        // 7️⃣ Deactivate unused obstacles
+        for (int i = maxObs; i < obstacles.Length; i++){
+            obstacles[i].gameObject.SetActive(false);
+        }
+
         deltaX = GetNearestDistance(transform.localPosition);
         calculateShortestPath();
         previousDistance = DistanceToTarget(); // Initialize distance tracking
     }
 
-    public override void CollectObservations(VectorSensor sensor)
-    {
+    public override void CollectObservations(VectorSensor sensor){
         // Agent state
-        sensor.AddObservation(rb.linearVelocity); // 2 values
-        sensor.AddObservation(rb.angularVelocity); // 1 value
-        sensor.AddObservation(transform.localPosition); // 2 values
+        sensor.AddObservation(rb.linearVelocity/10f); // 2 values
+        sensor.AddObservation(rb.angularVelocity/180f); // 1 value
+        sensor.AddObservation(transform.localPosition/16f); // 2 values
         
         // Agent orientation for stability
         float normalizedRotation = transform.eulerAngles.z;
@@ -130,9 +159,9 @@ public class Agent2D : Agent
         sensor.AddObservation(normalizedRotation / 180f); // 1 value, normalized to [-1,1]
         
         // Target information - CRITICAL for navigation!
-        Vector2 relativeTargetPos = (Vector2)goals[targetIndex].localPosition - (Vector2)transform.localPosition;
-        sensor.AddObservation(relativeTargetPos.normalized); // 2 values - direction to target
-        sensor.AddObservation(relativeTargetPos.magnitude / 35f); // 1 value - distance (normalized)
+        // Vector2 relativeTargetPos = (Vector2)goals[targetIndex].localPosition - (Vector2)transform.localPosition;
+        // sensor.AddObservation(relativeTargetPos.normalized); // 2 values - direction to target
+        // sensor.AddObservation(relativeTargetPos.magnitude / 35f); // 1 value - distance (normalized)
         
         // Total: 9 observations (was 6)
     }
@@ -143,10 +172,10 @@ public class Agent2D : Agent
         // droneHum.pitch = Mathf.Lerp(1.0f, 1.5f, speed / 10f);
         // Check if agent fell off
         if (transform.localPosition.y < -6f || transform.localPosition.y > 8f || transform.localPosition.x < -16f || transform.localPosition.x > 16f){ // pick a suitable value below the floor
-            AddReward(-50f); // optional: give negative reward
+            AddReward(-10f); // optional: give negative reward
             EndEpisode();
         }
-         if (raySensor != null){
+        if (raySensor != null){
             DrawRaySensorDebug();
         }
     }
@@ -154,26 +183,32 @@ public class Agent2D : Agent
     public override void OnActionReceived(ActionBuffers actions)
     {
         StepCnt++;
-        if (StepCnt > 10000){
+        if (StepCnt > maxStepCount){
             AddReward(-1f); // Penalty for timeout
             EndEpisode();
             return;
         }
         
+        //drone control
         float forceX = actions.ContinuousActions[0]; //-1 to +1
         float forceY = actions.ContinuousActions[1]; //-1 to +1
         float torque = actions.ContinuousActions[2]; //-1 to +1
-        
         rb.AddForce(new Vector2(forceX, forceY) * 10f, ForceMode2D.Force);
         rb.AddTorque(torque * 0.5f);
 
+
+         if (isManualControl){
+            // Skip rewards, penalties, and curriculum stats
+            previousDistance = DistanceToTarget(); // still update distance for LSTM consistency
+            lastPos = transform.localPosition;      // update lastPos for continuity
+            return;
+        }
         // Stability rewards
         float angleZ = transform.eulerAngles.z;
         float normalizedZRotation = angleZ > 180 ? angleZ - 360 : angleZ;
         float uprightReward = 1.0f - (Mathf.Abs(normalizedZRotation) / 180.0f);
         
-        if(Mathf.Abs(normalizedZRotation) > 72f)
-        {
+        if(Mathf.Abs(normalizedZRotation) > 72f){
             AddReward(-0.02f);
             if(Mathf.Abs(normalizedZRotation) > 85f)
             {
@@ -185,59 +220,30 @@ public class Agent2D : Agent
 
         // Progress towards target - KEY ADDITION!
         float currentDistance = DistanceToTarget();
-        float approachReward = (previousDistance - currentDistance) * 0.5f;
-        AddReward(approachReward); // Positive if getting closer, negative if moving away
+        float delta = currentDistance!=0?(previousDistance - currentDistance):0;
+        AddReward(Mathf.Clamp(delta * 2f, -0.01f, 0.05f));
         previousDistance = currentDistance;
         
         // Obstacle proximity penalty
-        float minObstacleDist = GetMinObstacleDistance();
-        if (minObstacleDist < 2.0f)
-        {
-            AddReward(-0.05f * (2.0f - minObstacleDist)); // Proportional penalty
-        }
+        // float minObstacleDist = GetMinObstacleDistance();
+        // if (minObstacleDist < 2.0f)
+        // {
+        //     AddReward(-0.05f * (2.0f - minObstacleDist)); // Proportional penalty
+        // }
 
         // Path efficiency
         float newDist = Vector2.Distance(transform.localPosition, lastPos);
         if (newDist < 0.001f){
-            AddReward(-0.1f); // Increased penalty for not moving
+            AddReward(-0.01f); // Increased penalty for not moving
         }
         distanceTraveled += newDist;
         lastPos = transform.localPosition;
         // Small negative reward to encourage efficiency and exploration
         AddReward(-0.001f);
         //collecting data
-        RecordStats(uprightReward);
-    }
-    
-    float GetMinObstacleDistance()
-    {
-        float minDist = Mathf.Infinity;
-        Collider2D[] nearbyObjects = Physics2D.OverlapCircleAll(transform.position, 3f);
-        
-        foreach(var col in nearbyObjects)
-        {
-            if (col != null && (col.CompareTag("Obstacle") || col.CompareTag("Ground")))
-            {
-                float dist = Vector2.Distance(transform.position, col.transform.position);
-                if (dist < minDist && dist > 0.1f) // Ignore very close/self collisions
-                {
-                    minDist = dist;
-                }
-            }
-        }
-        return minDist;
-    }
-
-    void RecordStats(float uprightReward)
-    {
         var recorder = Academy.Instance.StatsRecorder;
         recorder.Add("AngleStability", uprightReward);
-        recorder.Add("GroundCollision", groundCollision ? 1f : 0f);
-        recorder.Add("Reward", GetCumulativeReward());
-        recorder.Add("TargetsFound", goalsReached); // Simple metric
-        
     }
-   
     
     public override void Heuristic(in ActionBuffers actionsOut)
     {
@@ -260,6 +266,7 @@ public class Agent2D : Agent
 
     void OnCollisionEnter2D(Collision2D other){
         if (other.gameObject.CompareTag("Ground")){
+            groundCollision++;
             float impactSpeed = other.relativeVelocity.magnitude;
             if(1 < impactSpeed && impactSpeed < softLandingThreshold){
                 AddReward(1f); // Soft landing reward
@@ -275,7 +282,6 @@ public class Agent2D : Agent
                 AddReward(-0.2f); // Moderate penalty
                 Debug.Log("Moderate landing.");
             }
-            groundCollision = true;
         }
         
         if (other.gameObject.CompareTag("Obstacle")){
@@ -304,13 +310,13 @@ public class Agent2D : Agent
             other.gameObject.SetActive(false);
         }
         
-        if (goalsReached == 5){
+        if (goalsReached == goals.Length){
             float efficiency = shortestPath / Mathf.Max(distanceTraveled, 0.001f);
             var recorder = Academy.Instance.StatsRecorder;
             recorder.Add("Efficiency", efficiency);
             
             // Big success bonus!
-            AddReward(efficiency * 10.0f + 20.0f); // Efficiency bonus + completion bonus
+            AddReward(efficiency * 5f + 10f); // Efficiency bonus + completion bonus
             Debug.Log("All victims found. Mission complete!");
             EndEpisode();
         }
@@ -351,8 +357,6 @@ public class Agent2D : Agent
                 {
                     if (hit.collider.CompareTag("Victim")){
                         rayColor = Color.green;
-                        //if (Time.frameCount % 60 == 0) // Reduce console spam
-                            //Debug.Log($"Ray {i} hit Victim: {hit.collider.name} at distance: {hit.distance}");
                     }
                     else if (hit.collider.CompareTag("Ground") || hit.collider.CompareTag("Obstacle")) {
                         rayColor = Color.yellow;
@@ -374,7 +378,16 @@ public class Agent2D : Agent
         // Display the cumulative reward
         GUI.Label(new Rect(15, 25, 200, 30), 
                 "Reward: " + GetCumulativeReward().ToString("F2"), style);
+        GUI.Label(new Rect(15, 60, 300, 30), $"TargetDistance: {targetDistance}, Obstacles: {obstacleCount}");
+    }
+
+    void RecordStats(){
+        var recorder = Academy.Instance.StatsRecorder;
+        recorder.Add("EpisodeLength", StepCnt);
+        recorder.Add("TargetsFound", goalsReached);
+        recorder.Add("GroundCollision", groundCollision);
+        recorder.Add("PathEfficiency", shortestPath / Mathf.Max(distanceTraveled, 0.001f));
+        recorder.Add("FinalReward", GetCumulativeReward());
     }
 
 }
-
